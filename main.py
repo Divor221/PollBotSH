@@ -39,10 +39,10 @@ async def send_reminder():
 
 # Задачи
 def setup_scheduler():
-    # ПН (отправка в пятницу)
+    # Опрос на ПН (отправка в пятницу)
     scheduler.add_job(send_squash_poll, 'cron', day_of_week='fri', hour=18, minute=0, args=['пн'])
 
-    # ЧТ (отправка во вторник) + доп. опция
+    # Опрос на ЧТ (отправка во вторник) + доп. опция
     scheduler.add_job(send_squash_poll, 'cron', day_of_week='tue', hour=18, minute=00, args=['чт', ['Резерв, я был(а) в пн']])
 
     # Напоминалка за 5 минут до опроса
