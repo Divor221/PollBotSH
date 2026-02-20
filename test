@@ -1,0 +1,763 @@
+import asyncio
+import logging
+import os
+import json
+from dotenv import load_dotenv
+from aiogram import Bot, Dispatcher, F
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.filters import Command
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from aiogram.types import BotCommand
+
+load_dotenv()
+TOKEN = os.getenv("BOT_TOKEN")
+GROUP_ID = os.getenv("GROUP_ID")
+ALLOWED_USER_ID_ENV = os.getenv("ALLOWED_USER_ID")
+
+if not TOKEN:
+    raise ValueError("BOT_TOKEN не найден в переменных окружения")
+if not GROUP_ID:
+    raise ValueError("GROUP_ID не найден в переменных окружения")
+
+try:
+    GROUP_ID = int(GROUP_ID)
+except ValueError:
+    raise ValueError("GROUP_ID должен быть числом")
+
+try:
+    ALLOWED_USER_ID = int(ALLOWED_USER_ID_ENV)
+except ValueError:
+    raise ValueError("ALLOWED_USER_ID должен быть числом")
+
+bot = Bot(token=TOKEN)
+storage = MemoryStorage()
+dp = Dispatcher(storage=storage)
+scheduler = AsyncIOScheduler(timezone="Europe/Moscow")
+
+# ==================== Настройка команд в меню ====================
+async def set_commands(bot: Bot):
+    commands = [
+        BotCommand(command="start", description="Запустить бота"),
+        BotCommand(command="set_days", description="Настроить дни опросов"),
+        BotCommand(command="list_days", description="Показать расписание"),
+        BotCommand(command="remove_days", description="Удалить расписание"),
+        BotCommand(command="help", description="Помощь")
+    ]
+    await bot.set_my_commands(commands)
+
+# ==================== Middleware для проверки доступа ====================
+
+class AccessMiddleware:
+    """Middleware для проверки доступа пользователя.
+    В aiogram 3.x в обработчики передаётся сам объект события (Message или CallbackQuery)."""
+    
+    async def __call__(self, handler, event, data):
+        """Проверяет ID пользователя перед обработкой события"""
+        # event — это Message или CallbackQuery, у обоих есть from_user
+        user_id = getattr(event.from_user, "id", None)
+        
+        if user_id is None:
+            return await handler(event, data)
+        
+        if user_id != ALLOWED_USER_ID:
+            logging.warning(f"Попытка доступа от неавторизованного пользователя: {user_id}")
+            try:
+                # CallbackQuery.answer(show_alert=True) — всплывающее окно; Message.answer() — новое сообщение
+                if isinstance(event, CallbackQuery):
+                    await event.answer("❌ У вас нет доступа к этому боту.", show_alert=True)
+                else:
+                    await event.answer("❌ У вас нет доступа к этому боту.")
+            except Exception as e:
+                logging.error(f"Ошибка при отправке сообщения об отказе доступа: {e}")
+            return
+        
+        return await handler(event, data)
+
+# Регистрируем middleware
+dp.message.middleware(AccessMiddleware())
+dp.callback_query.middleware(AccessMiddleware())
+
+# Константы
+CONFIG_FILE = "schedule_config.json"
+MINUTES_OPTIONS = [0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55]
+HOURS_RANGE = range(10, 20)  # Часы с 10 до 20
+
+# Маппинг дней недели
+
+DAY_NAMES_RU = {
+    'mon': 'Понедельник', 'tue': 'Вторник', 'wed': 'Среда', 'thu': 'Четверг',
+    'fri': 'Пятница', 'sat': 'Суббота', 'sun': 'Воскресенье'
+}
+
+DAY_NAMES = {
+    'mon': 'Понедельник', 'tue': 'Вторник', 'wed': 'Среда', 'thu': 'Четверг',
+    'fri': 'Пятница', 'sat': 'Суббота', 'sun': 'Воскресенье'
+}
+# Состояния для FSM
+class ScheduleStates(StatesGroup):
+    waiting_for_extra_options = State()
+
+# ==================== Работа с конфигурацией ====================
+
+def load_config():
+    """Загружает конфигурацию из файла"""
+    if os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except Exception as e:
+            logging.error(f"Ошибка загрузки конфигурации: {e}")
+            return {}
+    return {}
+
+def save_config(config):
+    """Сохраняет конфигурацию в файл"""
+    try:
+        with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
+            json.dump(config, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logging.error(f"Ошибка сохранения конфигурации: {e}")
+
+def get_config():
+    """Получает конфигурацию с инициализацией schedules"""
+    config = load_config()
+    if 'schedules' not in config:
+        config['schedules'] = []
+    return config
+
+def validate_schedule(schedule):
+    """Проверяет корректность расписания"""
+    return all([
+        schedule.get('send_day'),
+        schedule.get('poll_day'),
+        schedule.get('hour') is not None,
+        schedule.get('minute') is not None
+    ])
+
+# ==================== Отправка сообщений ====================
+
+async def send_squash_poll(day_name: str, extra_options: list = None):
+    """Отправляет опрос в группу"""
+    options = ["Да", "Нет", "Резерв"]
+    if extra_options:
+        options.extend(extra_options)
+    options.append("Тренер")
+
+    try:
+        await bot.send_poll(
+            chat_id=GROUP_ID,
+            question=f"📊 Сквош в {day_name}?",
+            options=options,
+            is_anonymous=False
+        )
+        logging.info(f"Опрос на {day_name} отправлен")
+    except Exception as e:
+        logging.error(f"Ошибка при отправке опроса ({day_name}): {e}")
+
+async def send_reminder():
+    """Отправляет напоминание о голосовании"""
+    try:
+        await bot.send_message(chat_id=GROUP_ID, text="🔔 Голосование через 5 минут!")
+    except Exception as e:
+        logging.error(f"Ошибка напоминания: {e}")
+
+# ==================== Управление планировщиком ====================
+
+def clear_scheduler():
+    """Очищает все задачи планировщика"""
+    scheduler.remove_all_jobs()
+
+def calculate_reminder_time(hour: int, minute: int):
+    """Вычисляет время напоминания (за 5 минут до опроса)"""
+    reminder_minute = minute - 5
+    reminder_hour = hour
+    
+    if reminder_minute < 0:
+        reminder_minute += 60
+        reminder_hour -= 1
+        if reminder_hour < 0:
+            reminder_hour = 23
+    
+    return reminder_hour, reminder_minute
+
+def add_schedule(send_day: str, poll_day: str, hour: int, minute: int, extra_options: list = None):
+    """Добавляет задачу в планировщик"""
+    job_id = f"poll_{send_day}_{poll_day}"
+    scheduler.add_job(
+        send_squash_poll,
+        'cron',
+        day_of_week=send_day,
+        hour=hour,
+        minute=minute,
+        args=[poll_day, extra_options],
+        id=job_id,
+        replace_existing=True
+    )
+    logging.info(f"Добавлено расписание: опрос на {poll_day}, отправка в {DAY_NAMES_RU.get(send_day, send_day)}")
+
+def update_reminder_schedule():
+    """Обновляет расписание напоминаний на основе активных опросов"""
+    config = get_config()
+    
+    # Удаляем все старые напоминания
+    jobs = scheduler.get_jobs()
+    for job in jobs:
+        if job.id.startswith('reminder_'):
+            try:
+                scheduler.remove_job(job.id)
+            except Exception as e:
+                logging.warning(f"Не удалось удалить задачу {job.id}: {e}")
+    
+    # Создаем отдельное напоминание для каждого опроса
+    for schedule in config.get('schedules', []):
+        if not validate_schedule(schedule):
+            continue
+        
+        send_day = schedule.get('send_day')
+        poll_day = schedule.get('poll_day')
+        hour = schedule.get('hour')
+        minute = schedule.get('minute')
+        
+        reminder_hour, reminder_minute = calculate_reminder_time(hour, minute)
+        reminder_id = f"reminder_{send_day}_{poll_day}"
+        
+        scheduler.add_job(
+            send_reminder,
+            'cron',
+            day_of_week=send_day,
+            hour=reminder_hour,
+            minute=reminder_minute,
+            id=reminder_id,
+            replace_existing=True
+        )
+
+def setup_scheduler():
+    """Настраивает планировщик на основе сохраненной конфигурации"""
+    clear_scheduler()
+    config = get_config()
+    
+    schedules = config.get('schedules', [])
+    if not schedules:
+        logging.info("Нет сохраненных расписаний. Используйте /set_days для настройки.")
+        return
+    
+    for schedule in schedules:
+        if not validate_schedule(schedule):
+            logging.warning(f"Пропущено некорректное расписание: {schedule}")
+            continue
+        
+        add_schedule(
+            schedule.get('send_day'),
+            schedule.get('poll_day'),
+            schedule.get('hour'),
+            schedule.get('minute'),
+            schedule.get('extra_options')
+        )
+    
+    update_reminder_schedule()
+
+def add_schedule_to_config(send_day: str, poll_day: str, hour: int, minute: int, extra_options: list = None):
+    """Добавляет расписание в конфигурацию"""
+    config = get_config()
+    schedule_id = f"{send_day}_{poll_day}"
+    
+    # Удаляем старое расписание, если есть
+    config['schedules'] = [s for s in config['schedules'] if s.get('id') != schedule_id]
+    
+    # Добавляем новое
+    config['schedules'].append({
+        'id': schedule_id,
+        'send_day': send_day,
+        'poll_day': poll_day,
+        'hour': hour,
+        'minute': minute,
+        'extra_options': extra_options
+    })
+    
+    save_config(config)
+    setup_scheduler()
+
+def remove_schedule_from_config(send_day: str, poll_day: str):
+    """Удаляет расписание из конфигурации"""
+    config = get_config()
+    schedule_id = f"{send_day}_{poll_day}"
+    config['schedules'] = [s for s in config['schedules'] if s.get('id') != schedule_id]
+    save_config(config)
+    setup_scheduler()
+
+# ==================== Вспомогательные функции для UI ====================
+
+DAYS = {
+    "mon": "Понедельник",
+    "tue": "Вторник",
+    "wed": "Среда",
+    "thu": "Четверг",
+    "fri": "Пятница",
+    "sat": "Суббота",
+    "sun": "Воскресенье"
+}
+
+def create_days_keyboard(callback_prefix: str, back_callback: str = None) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    
+    for code, name in DAYS.items():
+        builder.row(InlineKeyboardButton(text=name, callback_data=f"{callback_prefix}_{code}"))
+    
+    if back_callback:
+        builder.row(InlineKeyboardButton(text="◀️ Назад", callback_data=back_callback))
+        
+    return builder.as_markup()
+
+def create_poll_days_keyboard(send_day: str) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    
+    for name in DAYS.values():
+        builder.row(InlineKeyboardButton(text=name, callback_data=f"set_poll_{send_day}_{name}"))
+    
+    builder.row(InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_send_day"))
+    
+    return builder.as_markup()
+
+
+def format_schedule_message(send_day: str, poll_day: str, hour: int, minute: int, extra_options: list = None):
+    """Форматирует сообщение о расписании"""
+    send_day_name = DAY_NAMES_RU.get(send_day, send_day)
+    text = (
+        f"✅ Расписание успешно добавлено!\n\n"
+        f"📅 Опрос на: {poll_day}\n"
+        f"📤 Отправка в: {send_day_name}\n"
+        f"⏰ Время отправки: {hour:02d}:{minute:02d}\n"
+    )
+    if extra_options:
+        options_text = ', '.join(extra_options)
+        text += f"📝 Дополнительные варианты: {options_text}"
+    else:
+        text += "📝 Дополнительные варианты: нет"
+    return text
+
+async def show_extra_options_menu(callback: CallbackQuery, send_day: str, poll_day: str, hour: int, minute: int):
+    """Показывает меню выбора дополнительных вариантов"""
+    send_day_name = DAY_NAMES_RU.get(send_day, send_day)
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Без дополнительных вариантов", callback_data="skip_extra_options")],
+        [InlineKeyboardButton(text="➕ Добавить дополнительные варианты", callback_data="add_extra_options")],
+        [InlineKeyboardButton(
+            text="◀️ Назад",
+            callback_data=f"back_to_time_{send_day}_{poll_day}"
+        )],
+    ])
+    
+    await callback.message.edit_text(
+        f"✅ День отправки опроса: {send_day_name}\n"
+        f"✅ День тренировки: {poll_day}\n"
+        f"✅ Время отправки: {hour:02d}:{minute:02d}\n\n"
+        f"Стандартный опрос состоит из вариантов:\n"    
+        f"▪Да\n"                                      
+        f"▪Нет\n"
+        f"▪Резерв\n"
+        f"▪Тренер\n"                                                                                          
+        f"📝 Хотите добавить дополнительные варианты в опрос?\n",
+        reply_markup=keyboard
+    )
+
+# ==================== Обработчики команд ====================
+
+@dp.message(Command("start"))
+async def cmd_start(message: Message):
+    """Команда /start"""
+    text = (
+        "👋 Привет! Я бот для управления опросами по сквошу.\n\n"
+        "📋 Доступные команды:\n"
+        "/set_days - Настроить дни для опросов\n"
+        "/list_days - Показать текущие настройки\n"
+        "/remove_days - Удалить расписание\n"
+        "/help - Помощь"
+    )
+    await message.answer(text)
+
+@dp.message(Command("help"))
+async def cmd_help(message: Message):
+    """Команда /help"""
+    text = (
+        "📖 Помощь по использованию бота:\n\n"
+        "🔹 /set_days - Добавить опрос\n"
+        "   Выберите день недели для отправки опроса и день тренировки\n\n"
+        "🔹 /list_days - Показать все запланированые отправки \n\n"
+        "🔹 /remove_days - Удалить расписание опросов\n\n"
+    )
+    await message.answer(text)
+
+@dp.message(Command("set_days"))
+async def cmd_set_days(message: Message):
+    """Команда для настройки дней"""
+    keyboard = create_days_keyboard("set_send")
+    await message.answer("📅 Выберите день недели для отправки опроса:", reply_markup=keyboard)
+
+@dp.message(Command("list_days"))
+async def cmd_list_days(message: Message):
+    """Команда для просмотра текущих настроек"""
+    config = get_config()
+    schedules = config.get('schedules', [])
+    
+    if not schedules:
+        await message.answer("📭 Нет активных расписаний. Используйте /set_days для добавления.")
+        return
+    
+    text = "📋 Текущие расписания:\n\n"
+    for schedule in schedules:
+        if not validate_schedule(schedule):
+            continue
+            
+        send_day = DAY_NAMES_RU.get(schedule.get('send_day'), schedule.get('send_day'))
+        poll_day = schedule.get('poll_day')
+        hour = schedule.get('hour')
+        minute = schedule.get('minute')
+        extra_options = schedule.get('extra_options')
+        
+        text += f"📅 Опрос на {poll_day}\n"
+        text += f"   📤 Отправка: {send_day} в {hour:02d}:{minute:02d}\n"
+        if extra_options:
+            options_text = ', '.join(extra_options)
+            text += f"   📝 Доп. опции: {options_text}\n"
+        text += "\n"
+    
+    await message.answer(text)
+
+@dp.message(Command("remove_days"))
+async def cmd_remove_days(message: Message):
+    """Команда для удаления расписаний"""
+    config = get_config()
+    schedules = config.get('schedules', [])
+    
+    if not schedules:
+        await message.answer("📭 Нет активных расписаний для удаления.")
+        return
+    
+    keyboard_buttons = []
+    for schedule in schedules:
+        if not validate_schedule(schedule):
+            continue
+            
+        send_day = schedule.get('send_day')
+        poll_day = schedule.get('poll_day')
+        send_day_name = DAY_NAMES_RU.get(send_day, send_day)
+        button_text = f"{send_day_name} → {poll_day}"
+        callback_data = f"remove_{send_day}_{poll_day}"
+        keyboard_buttons.append([InlineKeyboardButton(text=button_text, callback_data=callback_data)])
+    
+    keyboard_buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_main")])
+    keyboard = InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
+    await message.answer("🗑️ Выберите расписание для удаления:", reply_markup=keyboard)
+
+# ==================== Обработчики выбора дней ====================
+
+@dp.callback_query(F.data.startswith("set_send_"))
+async def process_send_day(callback: CallbackQuery):
+    """Обработка выбора дня отправки"""
+    send_day = callback.data.replace("set_send_", "")
+    await callback.answer()
+    
+    keyboard = create_poll_days_keyboard(send_day)
+    day_name = DAY_NAMES_RU.get(send_day, send_day)
+    await callback.message.edit_text(
+        f"✅ День отправки: {day_name}\n\n📅 Теперь выберите день тренировки:",
+        reply_markup=keyboard
+    )
+
+@dp.callback_query(F.data.startswith("set_poll_"))
+async def process_poll_day(callback: CallbackQuery):
+    """Обработка выбора дня опроса - показываем форму выбора времени"""
+    parts = callback.data.replace("set_poll_", "").split("_", 1)
+    send_day = parts[0]
+    poll_day = parts[1]
+    await callback.answer()
+    await show_time_selection(callback, send_day, poll_day, selected_hour=None)
+
+# ==================== Обработчики выбора времени ====================
+
+async def show_time_selection(callback: CallbackQuery, send_day: str, poll_day: str, selected_hour: int = None):
+    """Показывает форму выбора времени (часы и минуты на одной форме)"""
+    send_day_name = DAY_NAMES_RU.get(send_day, send_day)
+    keyboard_rows = []
+    
+    if selected_hour is None:
+        # Показываем часы (только с 10 до 20)
+        hour_buttons = [
+            InlineKeyboardButton(
+                text=f"{hour}",
+                callback_data=f"select_hour_{send_day}_{poll_day}_{hour}"
+            )
+            for hour in HOURS_RANGE
+        ]
+        
+        # Разбиваем часы на строки по 6 кнопок
+        for i in range(0, len(hour_buttons), 6):
+            keyboard_rows.append(hour_buttons[i:i+6])
+        
+        text = (
+            f"✅ День отправки опроса: {send_day_name}\n"
+            f"✅ День тренировки: {poll_day}\n\n"
+            f"⏰ Выберите час отправки:"
+        )
+    else:
+        # Показываем минуты для выбранного часа
+        minute_buttons = [
+            InlineKeyboardButton(
+                text=f"{minute:02d}",
+                callback_data=f"set_time_{send_day}_{poll_day}_{selected_hour}_{minute}"
+            )
+            for minute in MINUTES_OPTIONS
+        ]
+        
+        # Разбиваем минуты на строки по 4 кнопки
+        for i in range(0, len(minute_buttons), 4):
+            keyboard_rows.append(minute_buttons[i:i+4])
+        
+        keyboard_rows.append([InlineKeyboardButton(
+            text="🔄 Изменить час",
+            callback_data=f"back_to_time_{send_day}_{poll_day}"
+        )])
+        
+        text = (
+            f"✅ День отправки опроса: {send_day_name}\n"
+            f"✅ День тренировки: {poll_day}\n"
+            f"✅ Час: {selected_hour:02d}:00\n\n"
+            f"⏰ Выберите минуты:"
+        )
+    
+    keyboard_rows.append([InlineKeyboardButton(
+        text="◀️ Назад",
+        callback_data=f"back_to_poll_day_{send_day}"
+    )])
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=keyboard_rows)
+    await callback.message.edit_text(text, reply_markup=keyboard)
+
+@dp.callback_query(F.data.startswith("select_hour_"))
+async def select_hour(callback: CallbackQuery):
+    """Обработка выбора часа - обновляем форму, показывая минуты"""
+    parts = callback.data.replace("select_hour_", "").split("_")
+    send_day = parts[0]
+    poll_day = parts[1]
+    hour = int(parts[2])
+    await callback.answer()
+    await show_time_selection(callback, send_day, poll_day, selected_hour=hour)
+
+@dp.callback_query(F.data.startswith("back_to_time_"))
+async def back_to_time_selection(callback: CallbackQuery):
+    """Возврат к выбору часа"""
+    parts = callback.data.replace("back_to_time_", "").split("_")
+    send_day = parts[0]
+    poll_day = parts[1]
+    await callback.answer()
+    await show_time_selection(callback, send_day, poll_day, selected_hour=None)
+
+@dp.callback_query(F.data.startswith("set_time_"))
+async def process_time(callback: CallbackQuery, state: FSMContext):
+    """Обработка выбора времени (час и минуты) и переход к выбору дополнительных опций"""
+    parts = callback.data.replace("set_time_", "").split("_")
+    send_day = parts[0]
+    poll_day = parts[1]
+    hour = int(parts[2])
+    minute = int(parts[3])
+    await callback.answer()
+    
+    # Сохраняем данные в состоянии
+    await state.update_data(
+        send_day=send_day,
+        poll_day=poll_day,
+        hour=hour,
+        minute=minute
+    )
+    
+    await show_extra_options_menu(callback, send_day, poll_day, hour, minute)
+
+# ==================== Обработчики дополнительных опций ====================
+
+@dp.callback_query(F.data == "skip_extra_options")
+async def skip_extra_options(callback: CallbackQuery, state: FSMContext):
+    """Пропуск дополнительных опций и сохранение расписания"""
+    data = await state.get_data()
+    send_day = data.get('send_day')
+    poll_day = data.get('poll_day')
+    hour = data.get('hour')
+    minute = data.get('minute')
+    
+    add_schedule_to_config(send_day, poll_day, hour=hour, minute=minute, extra_options=None)
+    await state.clear()
+    
+    await callback.answer("✅ Расписание добавлено!")
+    await callback.message.edit_text(
+        format_schedule_message(send_day, poll_day, hour, minute, extra_options=None)
+    )
+
+@dp.callback_query(F.data == "add_extra_options")
+async def add_extra_options(callback: CallbackQuery, state: FSMContext):
+    """Запрос на ввод дополнительных опций"""
+    await callback.answer()
+    await state.set_state(ScheduleStates.waiting_for_extra_options)
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text="◀️ Назад",
+            callback_data="back_to_extra_choice"
+        )],
+    ])
+    
+    await callback.message.edit_text(
+        "📝 Введите дополнительные варианн для опроса.\n\n"
+        "Введите несколько опций, разделяя их точкой с запятой (;).\n"
+        "Например:\n"
+        "Резерв, я был(а) в пн; Другая опция; Третья опция\n\n",
+        reply_markup=keyboard
+    )
+
+@dp.callback_query(F.data == "back_to_extra_choice")
+async def back_to_extra_choice(callback: CallbackQuery, state: FSMContext):
+    """Возврат к выбору дополнительных опций"""
+    data = await state.get_data()
+    send_day = data.get('send_day')
+    poll_day = data.get('poll_day')
+    hour = data.get('hour')
+    minute = data.get('minute')
+    
+    if not all([send_day, poll_day, hour is not None, minute is not None]):
+        await callback.answer("❌ Ошибка: данные не найдены")
+        return
+    
+    await callback.answer()
+    await show_extra_options_menu(callback, send_day, poll_day, hour, minute)
+
+@dp.message(ScheduleStates.waiting_for_extra_options, Command("cancel"))
+async def cancel_extra_options(message: Message, state: FSMContext):
+    """Отмена добавления дополнительных опций"""
+    data = await state.get_data()
+    send_day = data.get('send_day')
+    poll_day = data.get('poll_day')
+    hour = data.get('hour')
+    minute = data.get('minute')
+    
+    if not all([send_day, poll_day, hour is not None, minute is not None]):
+        await message.answer("❌ Ошибка: данные не найдены")
+        return
+    
+    add_schedule_to_config(send_day, poll_day, hour=hour, minute=minute, extra_options=None)
+    await state.clear()
+    
+    send_day_name = DAY_NAMES_RU.get(send_day, send_day)
+    await message.answer(
+        f"✅ Расписание добавлено без дополнительных опций!\n\n"
+        f"📅 Опрос на: {poll_day}\n"
+        f"📤 Отправка в: {send_day_name}\n"
+        f"⏰ Время отправки: {hour:02d}:{minute:02d}"
+    )
+
+@dp.message(ScheduleStates.waiting_for_extra_options)
+async def process_extra_options(message: Message, state: FSMContext):
+    """Обработка введенных дополнительных опций"""
+    extra_options_text = message.text.strip()
+    
+    if not extra_options_text:
+        await message.answer("❌ Опции не могут быть пустыми. Попробуйте снова или нажмите назад для отмены.")
+        return
+    
+    # Разбиваем опции по точке с запятой
+    options = [opt.strip() for opt in extra_options_text.split(';') if opt.strip()]
+    
+    if not options:
+        await message.answer("❌ Не удалось распознать опции. Попробуйте снова или нажмите назад для отмены.")
+        return
+    
+    data = await state.get_data()
+    send_day = data.get('send_day')
+    poll_day = data.get('poll_day')
+    hour = data.get('hour')
+    minute = data.get('minute')
+    
+    if not all([send_day, poll_day, hour is not None, minute is not None]):
+        await message.answer("❌ Ошибка: данные не найдены")
+        return
+    
+    add_schedule_to_config(send_day, poll_day, hour=hour, minute=minute, extra_options=options)
+    await state.clear()
+    
+    await message.answer(
+        format_schedule_message(send_day, poll_day, hour, minute, extra_options=options)
+    )
+
+# ==================== Обработчики удаления ====================
+
+@dp.callback_query(F.data.startswith("remove_"))
+async def process_remove(callback: CallbackQuery):
+    """Обработка удаления расписания"""
+    parts = callback.data.replace("remove_", "").split("_", 1)
+    send_day = parts[0]
+    poll_day = parts[1]
+    
+    remove_schedule_from_config(send_day, poll_day)
+    
+    send_day_name = DAY_NAMES_RU.get(send_day, send_day)
+    await callback.answer(f"✅ Расписание удалено: {send_day_name} → {poll_day}")
+    await callback.message.edit_text(
+        f"✅ Расписание удалено:\n📅 Опрос на {poll_day}\n📤 Отправка в {send_day_name}"
+    )
+
+# ==================== Обработчики кнопки "Назад" ====================
+
+@dp.callback_query(F.data == "back_to_send_day")
+async def back_to_send_day(callback: CallbackQuery):
+    """Возврат к выбору дня отправки"""
+    await callback.answer()
+    keyboard = create_days_keyboard("set_send")
+    await callback.message.edit_text("📅 Выберите день недели для отправки опроса:", reply_markup=keyboard)
+
+@dp.callback_query(F.data.startswith("back_to_poll_day_"))
+async def back_to_poll_day(callback: CallbackQuery):
+    """Возврат к выбору дня опроса"""
+    send_day = callback.data.replace("back_to_poll_day_", "")
+    await callback.answer()
+    
+    keyboard = create_poll_days_keyboard(send_day)
+    day_name = DAY_NAMES_RU.get(send_day, send_day)
+    await callback.message.edit_text(
+        f"✅ День отправки: {day_name}\n\n📅 Теперь выберите день тренировки:",
+        reply_markup=keyboard
+    )
+
+@dp.callback_query(F.data == "back_to_main")
+async def back_to_main(callback: CallbackQuery):
+    """Возврат к главному меню"""
+    await callback.answer()
+    text = (
+        "👋 Привет! Я бот для управления опросами по сквошу.\n\n"
+        "📋 Доступные команды:\n"
+        "/set_days - Настроить дни для опросов\n"
+        "/list_days - Показать текущие настройки\n"
+        "/remove_days - Удалить расписание\n"
+        "/help - Помощь"
+    )
+    await callback.message.edit_text(text)
+
+# ==================== Главная функция ====================
+
+async def main():
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+    
+    setup_scheduler()
+    scheduler.start()
+    
+    try:
+        logging.info("Бот запущен...")
+        await set_commands(bot)  
+        await dp.start_polling(bot)
+    finally:
+        await bot.close()
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logging.info("Бот остановлен")
