@@ -4,6 +4,7 @@ import os
 import json
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, F
+from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.types import (
     Message, CallbackQuery, InlineKeyboardButton, BotCommand
 )
@@ -14,8 +15,6 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
-
-# Вспомогательные функции для инициализации и валидации переменных окружения.
 def get_required_env(var_name: str) -> str:
     """Получить требуемую переменную окружения, бросить ошибку если она пустая."""
     value = os.getenv(var_name, "").strip()
@@ -34,19 +33,40 @@ def parse_allowed_user_ids(raw_value: str) -> set[int]:
     return user_ids
 
 
-# ===== ИНИЦИАЛИЗАЦИЯ БОТА И ОКРУЖЕНИЯ =====
-# Загружаем переменные из .env, инициализируем Telegram Bot, Dispatcher и Scheduler.
+# --- Proxy
+def get_proxy_url_for_telegram() -> str | None:
+    # Если переменная NO_PROXY определена (даже пустая), прокси не используем
+    if "NO_PROXY" in os.environ:
+        logging.info("NO_PROXY отключает прокси для Telegram")
+        return None
+
+    # Иначе берём значение HTTPS_PROXY
+    proxy = os.getenv("HTTPS_PROXY", "").strip()
+    return proxy or None
+
+
+# --- Запуск бота и загрузка настроек окружения
 load_dotenv()
 TOKEN = get_required_env("BOT_TOKEN")
 GROUP_ID = int(get_required_env("GROUP_ID"))
 ALLOWED_USER_IDS = parse_allowed_user_ids(get_required_env("ALLOWED_USER_ID"))
 
-bot = Bot(token=TOKEN)
+_proxy_url = get_proxy_url_for_telegram()
+if _proxy_url:
+    # AiohttpSession(proxy=...) требует aiohttp-socks.
+    try:
+        bot_session = AiohttpSession(proxy=_proxy_url)
+    except Exception as exc:
+        logging.warning("Прокси игнорируется: %s", exc)
+        bot_session = AiohttpSession()
+else:
+    bot_session = AiohttpSession()
+
+bot = Bot(token=TOKEN, session=bot_session)
 dp = Dispatcher(storage=MemoryStorage())
 scheduler = AsyncIOScheduler(timezone="Europe/Moscow")
 
-# ===== КОНСТАНТЫ =====
-# Текстовые константы и справочники для сообщений, расписания и настроек времени.
+# --- Основные константы и текстовые шаблоны
 CONFIG_FILE = "schedule_config.json"
 MINUTES_OPTIONS = list(range(0, 60, 5))
 HOURS_RANGE = range(10, 22)
@@ -60,16 +80,14 @@ MAIN_COMMANDS_TEXT = (
 DAY_NAMES = {
     "mon": "Понедельник", "tue": "Вторник", "wed": "Среда",
     "thu": "Четверг", "fri": "Пятница", "sat": "Суббота", "sun": "Воскресенье"
-}}
+}
 
-# ===== СОСТОЯНИЯ FSM =====
-# Определение этапов диалога при создании нового расписания опроса.
+# --- Состояния диалога (FSM), через которые проходит пользователь
 class ScheduleStates(StatesGroup):
     waiting_for_title = State()
     waiting_for_options = State()
 
-# ===== MIDDLEWARE КОНТРОЛЯ ДОСТУПА =====
-# Перехватывает все входящие события и проверяет права пользователя перед обработкой.
+# --- Middleware, который пускает к боту только разрешённых пользователей
 class AccessMiddleware:
     async def __call__(self, handler, event, data):
         user_id = getattr(event.from_user, "id", None)
@@ -88,8 +106,7 @@ dp.callback_query.middleware(AccessMiddleware())
 EMPTY_CONFIG = {"schedules": []}
 
 
-# ===== УПРАВЛЕНИЕ КОНФИГУРАЦИЕЙ РАСПИСАНИЯ =====
-# Функции для загрузки, сохранения и обновления расписаний в JSON-файле.
+# --- Работа с файлом расписания: чтение, сохранение и обновление
 def load_config():
     """Загрузить расписания из schedule_config.json, вернуть пусто если файл отсутствует."""
     if not os.path.exists(CONFIG_FILE):
@@ -114,8 +131,7 @@ def update_config(schedule_id, data=None):
     save_config(cfg)
     setup_scheduler()
 
-# ===== ПЛАНИРОВЩИК СОБЫТИЙ =====
-# Настройка периодических задач для отправки опросов и напоминаний по расписанию.
+# --- Настройка планировщика задач (когда отправлять опросы и напоминания)
 def calculate_reminder(hour, minute):
     """Рассчитать время напоминания (за 5 минут до основного события)."""
     return (hour - (minute < 5)) % 24, (minute - 5) % 60
@@ -150,8 +166,7 @@ def setup_scheduler():
             replace_existing=True
         )
 
-# ===== ДЕЙСТВИЯ, ВЫПОЛНЯЕМЫЕ ПО РАСПИСАНИЮ =====
-# Функции, которые запускаются планировщиком для отправки опросов и напоминаний.
+# --- Что именно делает бот по расписанию (опросы и напоминания)
 async def send_squash_poll(day_name, options, poll_title=None):
     """Отправить опрос в группу (только если минимум 2 варианта)."""
     if not options or len(options) < 2:
@@ -169,8 +184,7 @@ async def send_reminder():
     """Отправить напоминание за 5 минут до опроса."""
     await bot.send_message(GROUP_ID, "🔔 Голосование через 5 минут!")
 
-# ===== УТИЛИТЫ ИНТЕРФЕЙСА: КЛАВИАТУРЫ И ТЕКСТЫ =====
-# Вспомогательные функции для формирования inline-клавиатур и текстов сообщений.
+# --- Вспомогательные функции интерфейса: клавиатуры и тексты для сообщений
 def send_day_selected_text(send_day):
     """Сформировать текст после выбора дня отправки."""
     return f"✅ Вы выбрали: {DAY_NAMES[send_day]}\nТеперь выберите день тренировки:"
@@ -232,8 +246,7 @@ def _hour_selected_text(send_day, poll_day, hour):
         "⏰ Выберите минуты:"
     )
 
-# ===== ОБРАБОТЧИКИ КОМАНД =====
-# Функции, которые срабатывают при вводе пользователем команд (/start, /set_days и т.д.).
+# --- Обработчики текстовых команд Telegram (/start, /set_days и т.д.)
 @dp.message(Command("start"))
 async def start(message: Message):
     await message.answer(
@@ -282,8 +295,7 @@ async def remove_days(message: Message):
     kb.row(InlineKeyboardButton(text="◀️ Назад", callback_data="back_main"))
     await message.answer("🗑️ Выберите расписание:", reply_markup=kb.as_markup())
 
-# ===== ОБРАБОТЧИКИ CALLBACK-ЗАПРОСОВ =====
-# Функции, которые срабатывают при нажатии пользователем inline-кнопок.
+# --- Обработчики нажатий на inline-кнопки (callback-запросы)
 @dp.callback_query(F.data == "back_send")
 async def back_to_send_day(callback: CallbackQuery):
     await callback.message.edit_text(SELECT_SEND_DAY_TEXT, reply_markup=kb_days("send"))
@@ -394,8 +406,9 @@ async def back_to_title_input(callback: CallbackQuery, state: FSMContext):
     send_day = data.get("send_day")
     poll_day = data.get("poll_day")
     hour = data.get("hour")
+    minute = data.get("minute")
 
-    if not send_day or not poll_day or hour is None:
+    if not send_day or not poll_day or hour is None or minute is None:
         await state.clear()
         await callback.message.edit_text(SELECT_SEND_DAY_TEXT, reply_markup=kb_days("send"))
         await callback.answer()
@@ -407,7 +420,7 @@ async def back_to_title_input(callback: CallbackQuery, state: FSMContext):
     )
     await state.set_state(ScheduleStates.waiting_for_title)
     await callback.message.edit_text(
-        f"Вы выбрали {hour:02d}:{data.get('minute', 0):02d}\n"
+         f"✅ День отправки: {DAY_NAMES[send_day]}\n✅ День тренировки: {poll_day}\n✅ Время отправки {int(hour):02d}:{int(minute):02d}\n"
         "🏷️ Введите название опроса.\n"
         "\n"
         "Пример: 📊 Сквош в четверг?",
@@ -448,19 +461,22 @@ async def delete_schedule(callback: CallbackQuery):
     await callback.message.edit_text("🗑️ Расписание удалено!")
     await callback.answer()
 
-# ===== ТОЧКА ВХОДА И ИНИЦИАЛИЗАЦИЯ =====
-# Инициализация команд бота и запуск основного цикла обработки событий.
 async def main():
     logging.basicConfig(level=logging.INFO)
     setup_scheduler()
     scheduler.start()
-    await bot.set_my_commands([
-        BotCommand(command="start", description="Запуск"),
-        BotCommand(command="set_days", description="Добавить опрос"),
-        BotCommand(command="list_days", description="Посмотреть расписание"),
-        BotCommand(command="remove_days", description="Удалить из расписания"),
-    ])
-    await dp.start_polling(bot)
+    try:
+        await bot.set_my_commands([
+            BotCommand(command="start", description="Запуск"),
+            BotCommand(command="set_days", description="Добавить опрос"),
+            BotCommand(command="list_days", description="Посмотреть расписание"),
+            BotCommand(command="remove_days", description="Удалить из расписания"),
+        ])
+        await dp.start_polling(bot)
+    finally:
+        # Корректное закрытие HTTP-сессии и остановка планировщика.
+        await bot.session.close()
+        scheduler.shutdown(wait=False)
 
 if __name__ == "__main__":
     asyncio.run(main())
